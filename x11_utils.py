@@ -62,6 +62,17 @@ def rescan_windows(pattern):
     logging.info("Rescanned windows: %s", filtered)
     return filtered
 
+def set_window_title(winid, title):
+    """
+    Tenta di impostare il titolo di una finestra usando xdotool.
+    """
+    logging.debug(f"Tentativo di rinominare {winid} in '{title}'")
+    try:
+        cmd = ['xdotool', 'set_window', '--name', title, str(winid)]
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        logging.exception(f"Errore in set_window_title per {winid}: {e}")
+
 def get_active_window():
     """Gets active window ID, returns empty string on failure."""
     try:
@@ -131,17 +142,29 @@ def activate_window(winid):
 
 def send_key_to_window(winid, keyname):
     """
-    use xdotool key --window <winid> <keyname>
-    Uses subprocess.Popen to fire-and-forget, avoiding deadlocks.
+    [FIX] Invia tasti in modo differenziato.
+    Usa 'type' per il testo (che funziona) e 'key' per i tasti speciali
+    e i modificatori (che funziona per le scorciatoie).
     """
     try:
-        cmd = ['xdotool','key','--clearmodifiers','--window', str(winid), keyname]
-        # Use Popen to launch the command and not wait for it.
-        # This prevents our event loop from blocking.
+        cmd = ['xdotool']
+        
+        # Se è un singolo carattere stampabile (testo o numeri)
+        if len(keyname) == 1 and keyname.isalnum():
+            logging.debug(f"Invio come 'type' a {winid}: {keyname}")
+            # Usiamo 'type' che funziona per il testo
+            cmd.extend(['type', '--clearmodifiers', '--window', str(winid), keyname])
+        
+        # Se è un tasto speciale (Space, Return, Escape, Alt_L, F1, ecc.)
+        else:
+            logging.debug(f"Invio come 'key' a {winid}: {keyname}")
+            # Usiamo 'key'
+            cmd.extend(['key', '--window', str(winid), keyname])
+            
         subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
     except Exception as e:
-        # This would only be a failure to *launch* the process
-        logging.exception("send_key Popen error for win %s key %s: %s", winid, keyname, e)
+        logging.exception(f"Errore Popen send_key a {winid} per {keyname}: {e}")
 
 # ------------------------- KEY GRABBING -------------------------
 
@@ -159,10 +182,13 @@ def grab_keys_for_list(disp, root, keys_to_grab):
             keycode = disp.keysym_to_keycode(keysym)
             if not keycode:
                 continue
+
             root.grab_key(keycode, X.AnyModifier, False, X.GrabModeAsync, X.GrabModeAsync)
             grabbed.append(keycode)
+
         except Exception:
             logging.exception("grab_keys error for %s", k)
+
     logging.info(f"Grabbing {len(grabbed)} keys.")
     return grabbed
 

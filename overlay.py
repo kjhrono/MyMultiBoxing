@@ -4,28 +4,45 @@
 
 import gi
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gtk, GLib
+from gi.repository import Gtk, GLib, Gdk
 
 # Import utilities to get window position
+import logging
 import x11_utils
 
 # ------------------------- OVERLAY -------------------------
 class Overlay:
-    """
-    Small popup window per game window, shows index and broadcast indicator.
-    """
-    def __init__(self, winid, index, color="#00FF00", show_broadcast=True):
+    def __init__(self, winid, index, color="#00FF00", font_size=36000, show_broadcast=True):
         self.winid = str(winid)
         self.index = index
         self.color = color
+        self.font_size = font_size
         self.show_broadcast = show_broadcast
-        self.is_active = False
+        # self.is_active = False # <-- RIMOSSO
         self.win = Gtk.Window(type=Gtk.WindowType.POPUP)
+
+        # --- TRASPARENZA (Corretta) ---
+        screen = self.win.get_screen()
+        visual = screen.get_rgba_visual()
+        if visual:
+            self.win.set_visual(visual)
+        self.win.set_app_paintable(True)
+        css_provider = Gtk.CssProvider()
+        css_data = b"""
+            window { background-color: rgba(0, 0, 0, 0); }
+            label { background-color: rgba(0, 0, 0, 0); }
+        """
+        css_provider.load_from_data(css_data)
+        context = self.win.get_style_context()
+        context.add_provider(css_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        # --- FINE TRASPARENZA ---
+
         self.win.set_decorated(False)
         self.win.set_keep_above(True)
         self.win.set_accept_focus(False)
         self.win.set_focus_on_map(False)
-        self.win.set_default_size(120, 40)
+        self.win.set_default_size(160, 60) 
+        
         self.label = Gtk.Label()
         self.label.set_markup(self._markup())
         self.win.add(self.label)
@@ -33,20 +50,25 @@ class Overlay:
 
     def _markup(self):
         dot = "🟢" if self.show_broadcast else "🔴"
+        icon_size = int(self.font_size * 0.6) # Icona scalabile
+        dot_span = f"<span size='{icon_size}'>{dot}</span>"
         
-        # If we are active, use a bright white. Otherwise, use the chosen color.
-        display_color = "#FFFFFF" if self.is_active else self.color
-        display_weight = "bold" if self.is_active else "normal"
+        # --- CORREZIONE COLORE ---
+        # Rimuoviamo la logica 'is_active'. Il colore è sempre self.color.
+        display_color = self.color 
+        display_weight = "bold" # Sempre grassetto, più visibile
+        # --- FINE CORREZIONE ---
+
         index_str = f"#{self.index + 1}" if self.index is not None else "#?"
             
-        return f"<span size='12000' weight='{display_weight}' foreground='{display_color}'>{index_str}</span>  {dot}"
+        return f"<span size='{self.font_size}' weight='{display_weight}' foreground='{display_color}'>{index_str}</span>  {dot_span}"
 
-    def update(self, index=None, color=None, show_broadcast=None, is_active=None):
+    def update(self, index=None, color=None, font_size=None, show_broadcast=None, is_active=None):
+        # 'is_active' viene ricevuto ma ignorato, non ci serve più qui
         if index is not None: self.index = index
         if color is not None: self.color = color
+        if font_size is not None: self.font_size = font_size
         if show_broadcast is not None: self.show_broadcast = show_broadcast
-        
-        if is_active is not None: self.is_active = is_active
         
         GLib.idle_add(self.label.set_markup, self._markup())
 

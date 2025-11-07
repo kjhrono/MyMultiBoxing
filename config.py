@@ -18,9 +18,11 @@ TMP_WINS_FILE = "/tmp/multiboxer_windows"
 # Default config
 DEFAULT_CONFIG = {
   "pattern": "World of Warcraft",
-  "broadcast_enabled": True,
+  "broadcast_enabled": False,
   "overlay_enabled": True,
   "overlay_color": "#00FF00",
+  "overlay_bgcolor": "#000000",
+  "overlay_font_size": 36000,
   "inhibit_keys": ["Alt_L","Alt_R","Control_L","Control_R","Escape"],
   "window_size": [1280, 720],
   "maximize_windows": False,
