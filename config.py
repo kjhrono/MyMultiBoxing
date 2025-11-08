@@ -20,6 +20,7 @@ TMP_WINS_FILE = "/tmp/multiboxer_windows"
 DEFAULT_CONFIG = {
   "pattern": "World of Warcraft",
   "broadcast_enabled": False,
+  "broadcast_mode": "focus_sweep",
   "overlay_enabled": True,
   "overlay_color": "#00FF00",
   "overlay_bgcolor": "#000000",

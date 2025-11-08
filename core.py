@@ -4,8 +4,11 @@
 import time
 import logging
 import threading
+import string
+from contextlib import contextmanager
 
 from pynput import keyboard
+from pynput.keyboard import Key, KeyCode
 from Xlib import X, XK, display
 from gi.repository import GLib
 
@@ -39,24 +42,32 @@ class CoreController:
         self.running = False
 
         # Input
-        self.current_keys = set()
+        self.current_keys = set()        # stores Key / KeyCode instances
+        self.pressed_names = set()       # NEW: stable names to suppress auto-repeat
         self.inhibit_keys = set(k.strip().lower() for k in self.config.get("inhibit_keys", []))
         self.shortcut_handler = ShortcutHandler(self.config)
+        self._mod_names = {"alt", "control", "shift", "meta", "super", "win"}
 
-        # Threads
+        # Threads & grabs
         self._poll_thread = None
         self._key_listener = None
-
-        # Grabbed keys bookkeeping (optional)
         self._grabbed_keycodes = []
 
-    # ---------------- Windows & overlays ----------------
+        # Injection guard (suppresses listener during focus-sweep injection)
+        self._suppress_events = 0
 
+    # ------------ injection guard ------------
+    @contextmanager
+    def injection_guard(self):
+        """Temporarily suppress key handling (used during focus-sweep injection)."""
+        self._suppress_events += 1
+        try:
+            yield
+        finally:
+            self._suppress_events = max(0, self._suppress_events - 1)
+
+    # ---------------- Windows & overlays ----------------
     def refresh_windows(self, pattern: str, custom_prefix: str = "WoW Window"):
-        """
-        Rescan windows by pattern and our custom prefix; rename with prefix + index;
-        create/update overlays accordingly. Returns ordered list of window ids.
-        """
         wins1 = self.x11.rescan_windows(pattern.strip())
         wins2 = self.x11.rescan_windows(custom_prefix)
 
@@ -93,25 +104,14 @@ class CoreController:
 
         for idx, w in enumerate(self.wins):
             if w not in self.overlays:
-                ov = self.Overlay(
-                    w, idx,
-                    color=color,
-                    font_size=font_size,
-                    show_broadcast=show_broadcast
-                )
+                ov = self.Overlay(w, idx, color=color, font_size=font_size, show_broadcast=show_broadcast)
                 self.overlays[w] = ov
             else:
-                self.overlays[w].update(
-                    index=idx,
-                    color=color,
-                    font_size=font_size,
-                    show_broadcast=show_broadcast
-                )
+                self.overlays[w].update(index=idx, color=color, font_size=font_size, show_broadcast=show_broadcast)
 
         for _, ov in self.overlays.items():
             ov.place_on_window()
 
-        # Ensure visibility follows current focus
         GLib.idle_add(self.update_overlay_visibility)
 
     def update_overlay_visibility(self):
@@ -131,12 +131,7 @@ class CoreController:
 
             for wid, ov in self.overlays.items():
                 if wid == active:
-                    ov.update(
-                        is_active=True,
-                        show_broadcast=is_broadcast,
-                        font_size=font_size,
-                        color=color
-                    )
+                    ov.update(is_active=True, show_broadcast=is_broadcast, font_size=font_size, color=color)
                     ov.show()
                     ov.place_on_window()
                 else:
@@ -144,7 +139,6 @@ class CoreController:
         return False
 
     # ---------------- Layout / actions ----------------
-
     def apply_layout(self, mode: str, size_w: int, size_h: int, scr_w: int, scr_h: int):
         if not self.wins:
             return "No captured windows"
@@ -204,7 +198,6 @@ class CoreController:
         GLib.timeout_add(700, self._after_close_all_refresh)
 
     def _after_close_all_refresh(self):
-        # no-op here (GUI will call refresh again if needed)
         return False
 
     def switch_next(self):
@@ -232,7 +225,6 @@ class CoreController:
             self.x11.activate_window(self.wins[idx])
 
     # ---------------- Config knobs used by GUI ----------------
-
     def set_broadcast_enabled(self, enabled: bool):
         self.config["broadcast_enabled"] = bool(enabled)
         self.broadcaster.set_enabled(bool(enabled))
@@ -258,7 +250,6 @@ class CoreController:
         self.shortcut_handler = ShortcutHandler(self.config)
 
     # ---------------- Focus/keys listener ----------------
-
     def start(self):
         if self.running:
             return
@@ -269,36 +260,26 @@ class CoreController:
 
     def stop(self):
         self.running = False
-
         try:
             if self._key_listener:
                 self._key_listener.stop()
         except Exception:
             logger.exception("Stopping key listener")
-
         try:
             self._ungrab_shortcuts()
         except Exception:
             logger.exception("Ungrab shortcuts")
-
-        # Restore titles
+        # restore titles / destroy overlays
         for wid, original in self.original_titles.items():
             if original:
-                try:
-                    self.x11.set_window_title(wid, original)
-                except Exception:
-                    pass
-        # Destroy overlays
+                try: self.x11.set_window_title(wid, original)
+                except Exception: pass
         for ov in list(self.overlays.values()):
-            try:
-                ov.destroy()
-            except Exception:
-                pass
+            try: ov.destroy()
+            except Exception: pass
         self.overlays.clear()
-
         try:
-            self._d.flush()
-            self._d.close()
+            self._d.flush(); self._d.close()
         except Exception:
             pass
 
@@ -323,26 +304,42 @@ class CoreController:
             if not self.running:
                 return False
 
-            # always track pressed set
-            try:
-                self.current_keys.add(key)
-            except Exception:
-                pass
+            # Ignore anything we ourselves inject during focus-sweep
+            if self._suppress_events:
+                return True
 
+            # Decode first to get a STABLE name
+            key_name, alt, ctrl, shift = self._decode_key_precise(key)
+            stable_name = self._stable_name_for_sets(key_name)
+
+            # ----- HARD FILTER: ignore pure modifier presses -----
+            is_modifier = key_name in self._mod_names
+            if is_modifier:
+                # track state but do not trigger any action/broadcast
+                self._track_press_sets(key, stable_name)
+                return True
+
+            # Edge-trigger: only act on first physical press (kills auto-repeat)
+            if stable_name in self.pressed_names:
+                return True  # swallow repeats
+
+            # Now track sets for the first time
+            self._track_press_sets(key, stable_name)
+
+            # Only react when focus is one of our target windows
             active = self.x11.get_active_window()
             if active not in self.wins:
                 return True
 
-            # Build normalized combo string
-            key_name, alt, ctrl, shift = self._decode_key(key)
             combo_now = normalize_shortcut("+".join(
                 (["alt"] if alt else []) +
                 (["control"] if ctrl else []) +
                 (["shift"] if shift else []) +
                 [key_name]
             ))
+            logger.debug("DECODE: key=%r combo=%r alt=%s ctrl=%s shift=%s", key_name, combo_now, alt, ctrl, shift)
 
-            # 1) Shortcuts handled internally (no broadcast)
+            # App shortcuts (actions or focus N)
             matched = self.shortcut_handler.match(combo_now)
             if matched:
                 kind, payload = matched
@@ -350,38 +347,66 @@ class CoreController:
                     self._exec_action(payload)
                 elif kind == "window":
                     self.focus_index(payload)
-                return True  # don't broadcast
-
-            # 2) Normal key: broadcast if enabled
-            if not self.config.get("broadcast_enabled", False):
                 return True
 
+            if not self.config.get("broadcast_enabled", False):
+                return True
             if key_name in self.inhibit_keys or combo_now in self.inhibit_keys:
                 return True
 
-            # Compose xdotool sequence (e.g., alt+ctrl+a or Return)
+            # Printable literal without modifiers -> send_literal
+            if not (alt or ctrl or shift) and self._is_printable_char(key_name):
+                ch = self._normalize_printable_char(key_name)
+                logger.debug("TX: literal -> %r", ch)
+                self._log_targets("TYPE", ch, active)
+                if self.broadcaster.is_focus_sweep():
+                    with self.injection_guard():
+                        self.broadcaster.send_literal(ch, self.wins, exclude=active)
+                else:
+                    self.broadcaster.send_literal(ch, self.wins, exclude=active)
+                return True
+
+            # Otherwise use key sequence
+            send_key = self._map_key_for_xdotool(key_name)
             seq_parts = []
             if alt: seq_parts.append("alt")
             if ctrl: seq_parts.append("ctrl")
             if shift: seq_parts.append("shift")
-
-            # name mapping
-            send_key = key_name
-            if send_key == "enter":
-                send_key = "Return"
-            elif send_key == "tab":
-                send_key = "Tab"
-            elif send_key == "backspace":
-                send_key = "BackSpace"
-            elif send_key.startswith("f") and send_key[1:].isdigit():
-                send_key = send_key.upper()  # F1..F12
-            # else keep lower for letters/digits/punct
-
             seq = "+".join(seq_parts + [send_key]) if seq_parts else send_key
-            self.broadcaster.broadcast(seq, self.wins, exclude=active)
+            logger.debug("TX: keyseq -> %r", seq)
+            self._log_targets("KEY", seq, active)
+            if self.broadcaster.is_focus_sweep():
+                with self.injection_guard():
+                    self.broadcaster.send_key(seq, self.wins, exclude=active)
+            else:
+                self.broadcaster.send_key(seq, self.wins, exclude=active)
             return True
 
         def on_release(key):
+            # Decode a stable name for reliable cleanup
+            stable = None
+            if isinstance(key, KeyCode) and key.char:
+                stable = self._stable_name_for_sets(key.char.lower())
+            else:
+                special_map = {
+                    Key.enter: "enter", Key.space: "space", Key.tab: "tab",
+                    Key.backspace: "backspace", Key.esc: "escape",
+                    Key.up: "up", Key.down: "down", Key.left: "left", Key.right: "right",
+                    Key.home: "home", Key.end: "end", Key.page_up: "page_up", Key.page_down: "page_down",
+                    Key.delete: "delete", Key.insert: "insert",
+                    Key.shift: "shift", Key.shift_l: "shift", Key.shift_r: "shift",
+                    Key.ctrl: "control", Key.ctrl_l: "control", Key.ctrl_r: "control",
+                    Key.alt: "alt", Key.alt_l: "alt", Key.alt_r: "alt",
+                }
+                if key in special_map:
+                    stable = special_map[key]
+                else:
+                    s = str(key).replace("Key.", "").lower()
+                    stable = self._stable_name_for_sets(s)
+
+            # Clean both tracking sets
+            if stable in self.pressed_names:
+                self.pressed_names.remove(stable)
             try:
                 if key in self.current_keys:
                     self.current_keys.remove(key)
@@ -399,29 +424,89 @@ class CoreController:
         )
         self._key_listener.start()
 
-    def _decode_key(self, key):
+
+    # ---------- helpers for key mapping & logging ----------
+    def _stable_name_for_sets(self, key_name: str) -> str:
         """
-        Returns (key_name, alt, ctrl, shift)
-        key_name is lower-case; letters/digits are plain, special as pynput names (enter, space,...)
+        A stable identifier for pressed_names set:
+        1-char literals: the char itself (e.g., 'a', '1', ',')
+        specials/modifiers: canonical names matching our decode (e.g., 'enter','alt')
         """
-        # key name
-        if hasattr(key, "char") and key.char:
-            key_name = key.char.lower()
-        else:
-            # e.g., Key.space -> "space"
-            key_name = str(key).replace("Key.", "").lower()
+        if not key_name:
+            return ""
+        if len(key_name) == 1:
+            return key_name
+        return key_name  # already canonical from _decode_key_precise
 
-        # modifiers from the pressed set
-        alt = any("alt" in str(k).lower() for k in self.current_keys)
-        ctrl = any("ctrl" in str(k).lower() for k in self.current_keys)
-        shift = any("shift" in str(k).lower() for k in self.current_keys)
+    def _is_printable_char(self, key_name: str) -> bool:
+        if not key_name or len(key_name) != 1:
+            return False
+        return key_name in string.printable and key_name not in ("\t", "\n", "\r", "\x0b", "\x0c")
 
-        return key_name, alt, ctrl, shift
+    def _normalize_printable_char(self, key_name: str) -> str:
+        return key_name
 
-    # ---------------- Shortcuts grab (optional best-effort) ----------------
+    def _map_key_for_xdotool(self, key_name: str) -> str:
+        k = key_name
+        if k == "enter": return "Return"
+        if k == "space": return "space"
+        if k == "tab": return "Tab"
+        if k == "backspace": return "BackSpace"
+        if k.startswith("f") and k[1:].isdigit(): return k.upper()
+        return k
 
+    def _decode_key_precise(self, key):
+        keys = self.current_keys
+        alt = any(k in keys for k in (Key.alt, Key.alt_l, Key.alt_r))
+        ctrl = any(k in keys for k in (Key.ctrl, Key.ctrl_l, Key.ctrl_r))
+        shift = any(k in keys for k in (Key.shift, Key.shift_l, Key.shift_r))
+
+        if isinstance(key, KeyCode) and key.char:
+            name = key.char.lower()
+            if name == " ":
+                name = " "
+            return name, alt, ctrl, shift
+
+        special_map = {
+            Key.enter: "enter", Key.space: "space", Key.tab: "tab",
+            Key.backspace: "backspace", Key.esc: "escape",
+            Key.up: "up", Key.down: "down", Key.left: "left", Key.right: "right",
+            Key.home: "home", Key.end: "end", Key.page_up: "page_up", Key.page_down: "page_down",
+            Key.delete: "delete", Key.insert: "insert",
+        }
+        if key in special_map:
+            return special_map[key], alt, ctrl, shift
+
+        for i, fk in enumerate((Key.f1, Key.f2, Key.f3, Key.f4, Key.f5, Key.f6,
+                                Key.f7, Key.f8, Key.f9, Key.f10, Key.f11, Key.f12), start=1):
+            if key == fk:
+                return f"f{i}", alt, ctrl, shift
+
+        name = str(key).replace("Key.", "").lower()
+        return name, alt, ctrl, shift
+
+    def _log_targets(self, mode: str, payload: str, exclude_active):
+        try:
+            wmap = self.x11.wmctrl_list()
+        except Exception:
+            wmap = {}
+        for wid in self.wins:
+            if exclude_active and wid == exclude_active:
+                continue
+            title = wmap.get(str(wid), ("", "", "", "", "", "", ""))[-1] if wmap else ""
+            logger.debug("SEND %s -> win=%s title=%r payload=%r", mode, wid, title, payload)
+    
+    def _track_press_sets(self, key, stable_name: str):
+        """Record a press in both tracking sets (object + stable name)."""
+        try:
+            self.current_keys.add(key)
+        except Exception:
+            pass
+        if stable_name:
+            self.pressed_names.add(stable_name)
+
+    # ---------------- shortcut grabbing ----------------
     def _try_grab_shortcuts(self):
-        """Best effort X11 grab to improve shortcut reliability. Non-fatal."""
         try:
             self._grabbed_keycodes = []
             for combo in self.shortcut_handler.all_shortcut_combos():
@@ -429,22 +514,14 @@ class CoreController:
                 keyname = parts[-1]
                 modifiers = parts[:-1]
                 mask = self._modifiers_to_mask(modifiers)
-
-                keysym = XK.string_to_keysym(keyname)
-                if keysym == 0:
-                    keysym = XK.string_to_keysym("Key_" + keyname)
-                if keysym == 0:
+                keysym = XK.string_to_keysym(keyname) or XK.string_to_keysym("Key_" + keyname)
+                if not keysym:
                     continue
-
                 keycode = self._d.keysym_to_keycode(keysym)
-                if keycode == 0:
+                if not keycode:
                     continue
-
                 try:
-                    self._root.grab_key(
-                        keycode, mask, True,
-                        X.GrabModeAsync, X.GrabModeAsync
-                    )
+                    self._root.grab_key(keycode, mask, True, X.GrabModeAsync, X.GrabModeAsync)
                     self._grabbed_keycodes.append((keycode, mask))
                 except Exception:
                     pass
@@ -466,15 +543,9 @@ class CoreController:
 
     def _modifiers_to_mask(self, modifiers):
         modmap = {
-            "shift": X.ShiftMask,
-            "control": X.ControlMask,
-            "ctrl": X.ControlMask,
-            "alt": X.Mod1Mask,
-            "mod1": X.Mod1Mask,
-            "mod4": X.Mod4Mask,
-            "super": X.Mod4Mask,
-            "win": X.Mod4Mask,
-            "meta": X.Mod4Mask,
+            "shift": X.ShiftMask, "control": X.ControlMask, "ctrl": X.ControlMask,
+            "alt": X.Mod1Mask, "mod1": X.Mod1Mask, "mod4": X.Mod4Mask,
+            "super": X.Mod4Mask, "win": X.Mod4Mask, "meta": X.Mod4Mask,
         }
         mask = 0
         for m in modifiers:
@@ -482,17 +553,10 @@ class CoreController:
         return mask
 
     # ---------------- Execute shortcut actions ----------------
-
     def _exec_action(self, action_name: str):
-        if action_name == "prev":
-            self.switch_prev()
-        elif action_name == "next":
-            self.switch_next()
-        elif action_name == "minimize_all":
-            self.minimize_all()
-        elif action_name == "close_all":
-            self.close_all()
-        elif action_name == "toggle_broadcast":
-            self.set_broadcast_enabled(not self.config.get("broadcast_enabled", False))
-        elif action_name == "toggle_overlay":
-            self.set_overlay_enabled(not self.config.get("overlay_enabled", True))
+        if action_name == "prev": self.switch_prev()
+        elif action_name == "next": self.switch_next()
+        elif action_name == "minimize_all": self.minimize_all()
+        elif action_name == "close_all": self.close_all()
+        elif action_name == "toggle_broadcast": self.set_broadcast_enabled(not self.config.get("broadcast_enabled", False))
+        elif action_name == "toggle_overlay": self.set_overlay_enabled(not self.config.get("overlay_enabled", True))

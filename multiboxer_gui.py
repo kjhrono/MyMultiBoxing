@@ -42,7 +42,11 @@ class MultiboxerApp(Gtk.Window):
 
         # Load config and build core
         self.cfg = config.load_config()
-        self.broadcaster = Broadcaster(x11_utils, enabled=self.cfg.get("broadcast_enabled", False))
+        self.broadcaster = Broadcaster(
+            x11_utils,
+            enabled=self.cfg.get("broadcast_enabled", False),
+            mode=self.cfg.get("broadcast_mode", "focus_sweep")  # default to focus_sweep
+        )
         self.core = CoreController(self.cfg, x11_utils, Overlay, self.broadcaster)
 
         # UI
