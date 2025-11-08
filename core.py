@@ -329,7 +329,6 @@ class CoreController:
             except Exception:
                 pass
 
-            # Only react when focus is on one of our target windows
             active = self.x11.get_active_window()
             if active not in self.wins:
                 return True
