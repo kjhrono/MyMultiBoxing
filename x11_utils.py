@@ -5,7 +5,11 @@
 import os
 import subprocess
 import logging
-from Xlib import X, XK
+from Xlib import X, XK, display
+
+from pynput import keyboard
+import subprocess
+import shlex
 
 # Import path from config
 from config import TMP_WINS_FILE
@@ -73,11 +77,13 @@ def set_window_title(winid, title):
     except Exception as e:
         logging.exception(f"Errore in set_window_title per {winid}: {e}")
 
-def get_active_window():
-    """Gets active window ID, returns empty string on failure."""
+def get_window_name(win_id):
+    """Prende il nome della finestra dall'ID"""
     try:
-        out = subprocess.check_output(["xdotool","getactivewindow"]).decode().strip()
-        return out if out else ""
+        name = subprocess.check_output(
+            ["xdotool", "getwindowname", str(win_id)], stderr=subprocess.DEVNULL
+        ).decode().strip()
+        return name
     except subprocess.CalledProcessError:
         return ""
 
@@ -133,74 +139,23 @@ def maximize_window(winid):
 def minimize_window(winid):
     subprocess.call(['wmctrl','-ir', str(winid), '-b', 'add,hidden'])
 
+def get_active_window():
+    """Restituisce l'ID della finestra attiva (come stringa) o una stringa vuota."""
+    try:
+        # Usiamo check_output per catturare l'output
+        out = subprocess.check_output(
+            ["xdotool", "getactivewindow"], stderr=subprocess.DEVNULL
+        ).decode().strip()
+        return out if out else ""
+    except subprocess.CalledProcessError:
+        return ""
+
 def activate_window(winid):
     """Focuses/activates a window using xdotool."""
     try:
         subprocess.call(['xdotool','windowactivate','--sync', str(winid)])
     except Exception as e:
         logging.exception("activate_window error for win %s: %s", winid, e)
-
-def send_key_to_window(winid, keyname):
-    """
-    [FIX] Invia tasti in modo differenziato.
-    Usa 'type' per il testo (che funziona) e 'key' per i tasti speciali
-    e i modificatori (che funziona per le scorciatoie).
-    """
-    try:
-        cmd = ['xdotool']
-        
-        # Se è un singolo carattere stampabile (testo o numeri)
-        if len(keyname) == 1 and keyname.isalnum():
-            logging.debug(f"Invio come 'type' a {winid}: {keyname}")
-            # Usiamo 'type' che funziona per il testo
-            cmd.extend(['type', '--clearmodifiers', '--window', str(winid), keyname])
-        
-        # Se è un tasto speciale (Space, Return, Escape, Alt_L, F1, ecc.)
-        else:
-            logging.debug(f"Invio come 'key' a {winid}: {keyname}")
-            # Usiamo 'key'
-            cmd.extend(['key', '--window', str(winid), keyname])
-            
-        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        
-    except Exception as e:
-        logging.exception(f"Errore Popen send_key a {winid} per {keyname}: {e}")
-
-# ------------------------- KEY GRABBING -------------------------
-
-def grab_keys_for_list(disp, root, keys_to_grab):
-    """Grabs a specific list of keys."""
-    grabbed = []
-    for k in keys_to_grab:
-        try:
-            keysym = XK.string_to_keysym(k) if isinstance(k,str) else 0
-            if keysym==0:
-                keysym = XK.string_to_keysym(k.upper())
-            if keysym==0:
-                logging.debug("Unknown keysym: %s", k)
-                continue
-            keycode = disp.keysym_to_keycode(keysym)
-            if not keycode:
-                continue
-
-            root.grab_key(keycode, X.AnyModifier, False, X.GrabModeAsync, X.GrabModeAsync)
-            grabbed.append(keycode)
-
-        except Exception:
-            logging.exception("grab_keys error for %s", k)
-
-    logging.info(f"Grabbing {len(grabbed)} keys.")
-    return grabbed
-
-def ungrab_keys_for_list(disp, root, grabbed_keycodes):
-    """Ungrabs the provided list of keycodes."""
-    logging.info(f"Ungrabbing {len(grabbed_keycodes)} keys.")
-    for keycode in grabbed_keycodes:
-        try:
-            root.ungrab_key(keycode, X.AnyModifier)
-        except Exception:
-            pass
-    disp.flush()
 
 def close_window(winid):
     """Sends a close signal to the window."""
@@ -209,3 +164,96 @@ def close_window(winid):
         subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception as e:
         logging.exception("close_window Popen error for win %s: %s", winid, e)
+
+# ------------------------- KEY GRABBING -------------------------
+def grab_key(window, keyname, modifier_mask=X.AnyModifier):
+    """Grab a key on the specified window with optional modifier mask."""
+    try:
+        # Use the global display instance
+        from Xlib import display as xdisplay
+        d = xdisplay.Display()
+        
+        keysym = XK.string_to_keysym(keyname)
+        if keysym == 0:
+            # Try with "Key_" prefix for special keys
+            keysym = XK.string_to_keysym("Key_" + keyname)
+        if keysym == 0:
+            logging.warning(f"Could not find keysym for key: {keyname}")
+            return None
+            
+        keycode = d.keysym_to_keycode(keysym)
+        if keycode == 0:
+            logging.warning(f"Could not find keycode for keysym: {keysym} ({keyname})")
+            return None
+            
+        window.grab_key(keycode, modifier_mask, True,
+                       X.GrabModeAsync, X.GrabModeAsync)
+        logging.debug(f"Successfully grabbed key: {keyname} (keycode: {keycode}, modifiers: {modifier_mask})")
+        return keycode
+    except Exception as e:
+        logging.exception(f"Error grabbing key {keyname}")
+        return None
+
+def ungrab_key(window, keycode, modifier_mask=X.AnyModifier):
+    """Ungrab a key on the specified window."""
+    try:
+        window.ungrab_key(keycode, modifier_mask)
+        logging.debug(f"Successfully ungrabbed keycode: {keycode}")
+    except Exception as e:
+        logging.warning(f"Error ungrabbing keycode {keycode}: {e}")
+
+def send_key_to_window(winid, key_sequence):
+    """
+    Send a key sequence to a specific window using xdotool.
+    key_sequence: can be single key "a" or modified "alt+a"
+    """
+    try:
+        # Convert key sequence to xdotool format
+        if '+' in key_sequence:
+            # It's a modified key like "alt+a"
+            parts = key_sequence.split('+')
+            modifiers = parts[:-1]
+            key = parts[-1]
+            
+            # Build xdotool command
+            cmd = ['xdotool', 'key', '--window', str(winid)]
+            for mod in modifiers:
+                cmd.append(f'{mod.lower()}+')
+            cmd.append(key.lower())
+            
+            # Flatten the command
+            flat_cmd = []
+            for item in cmd:
+                if item.endswith('+'):
+                    flat_cmd.append(item[:-1])  # Remove trailing +
+                    flat_cmd.append('+')
+                else:
+                    flat_cmd.append(item)
+            # Remove any trailing +
+            if flat_cmd and flat_cmd[-1] == '+':
+                flat_cmd.pop()
+                
+            subprocess.Popen(flat_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            # Simple key
+            cmd = ['xdotool', 'key', '--window', str(winid), key_sequence.lower()]
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            
+        logging.debug(f"Sent key '{key_sequence}' to window {winid}")
+        return True
+        
+    except Exception as e:
+        logging.error(f"Error sending key to window {winid}: {e}")
+        return False
+
+def broadcast_key_to_windows(key_sequence, target_windows, exclude_window=None):
+    """
+    Broadcast a key sequence to all target windows except the exclude_window.
+    """
+    success_count = 0
+    for winid in target_windows:
+        if winid != exclude_window:
+            if send_key_to_window(winid, key_sequence):
+                success_count += 1
+    logging.debug(f"Broadcast '{key_sequence}' to {success_count} windows (excluded: {exclude_window})")
+    return success_count

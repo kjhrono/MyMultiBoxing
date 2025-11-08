@@ -8,10 +8,11 @@ import logging
 
 # ------------------------- CONFIG / PATHS -------------------------
 HOME = os.path.expanduser("~")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_DIR = os.path.join(HOME, ".config", "multiboxer")
 os.makedirs(CONFIG_DIR, exist_ok=True)
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
-LOG_FILE = os.path.join(CONFIG_DIR, "debug.log")
+LOG_FILE = os.path.join(SCRIPT_DIR, "debug.log")
 TMP_WINS_FILE = "/tmp/multiboxer_windows"
 
 # ------------------------- DEFAULT CONFIG -------------------------
@@ -30,7 +31,7 @@ DEFAULT_CONFIG = {
     "prev": "Alt+a",
     "next": "Alt+d",
     "minimize_all": "Alt+m",
-    "close_all": "Alt+CANC",
+    "close_all": "Alt+Delete", 
     "toggle_broadcast": "Alt+b",
     "toggle_overlay": "Alt+o",
     "window_keys": ["Alt+F1","Alt+F2","Alt+F3","Alt+F4","Alt+F5"]
